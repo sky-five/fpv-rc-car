@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RC Car — Cockpit</title>
+<style>
+  :root {
+    --amber:#f2cc0c; --cyan:#38d0ff; --danger:#ff3b30; --ink:#07090a;
+    --panel:rgba(7,11,14,.55); --hair:rgba(255,255,255,.14);
+    --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:#000; color:#eaf2f6; font-family:var(--mono); overflow:hidden; }
+  #v { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; transition:transform .15s; }
+  #fx { position:fixed; inset:0; pointer-events:none; mix-blend-mode:soft-light;
+    background:radial-gradient(130% 90% at 50% 50%, transparent 55%, rgba(0,0,0,.7) 100%); }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+
+  .panel { position:absolute; background:var(--panel); border:1px solid var(--hair); border-radius:14px;
+    padding:12px 14px; backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+  .eyebrow { font-size:11px; letter-spacing:.2em; text-transform:uppercase; color:#93a6b1; }
+
+  #cluster { top:18px; left:18px; display:flex; align-items:center; gap:14px; }
+  #gear { font-weight:800; font-size:54px; line-height:.82; color:var(--amber);
+    text-shadow:0 0 22px rgba(242,204,12,.35); min-width:74px; text-align:center; }
+  #gear.rev { color:var(--danger); text-shadow:0 0 22px rgba(255,59,48,.5); }
+  #cluster .meta { display:flex; flex-direction:column; gap:4px; }
+  #drv { font-size:14px; letter-spacing:.04em; color:var(--cyan); }
+  #drvsub { font-size:11px; color:#8da0ab; letter-spacing:.12em; text-transform:uppercase; }
+
+  #status { top:18px; right:18px; min-width:200px; }
+  #status .row { display:flex; align-items:center; gap:8px; margin:3px 0; font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#555; box-shadow:0 0 8px #555; flex:0 0 auto; }
+  .dot.live { background:var(--cyan); box-shadow:0 0 10px var(--cyan); }
+  .dot.warn { background:var(--danger); box-shadow:0 0 10px var(--danger); }
+  .dot.wait { background:var(--amber); box-shadow:0 0 10px var(--amber); }
+  #cam { margin-left:auto; font-weight:700; letter-spacing:.14em; color:var(--cyan); }
+  #cam.front { color:var(--danger); }
+  .muted { color:#8da0ab; }
+
+  /* Car WiFi signal meter (mirrors the ESP32 OLED bars) */
+  .wifi { display:inline-flex; align-items:flex-end; gap:2px; height:14px; }
+  .wifi i { width:3px; background:#3a474e; border-radius:1px; transition:background .2s, box-shadow .2s; }
+  .wifi i:nth-child(1){ height:5px; }
+  .wifi i:nth-child(2){ height:8px; }
+  .wifi i:nth-child(3){ height:11px; }
+  .wifi i:nth-child(4){ height:14px; }
+  .wifi.lvl1 i:nth-child(-n+1){ background:var(--danger); box-shadow:0 0 6px rgba(255,59,48,.5); }
+  .wifi.lvl2 i:nth-child(-n+2){ background:var(--amber);  box-shadow:0 0 6px rgba(242,204,12,.45); }
+  .wifi.lvl3 i:nth-child(-n+3){ background:var(--cyan);   box-shadow:0 0 6px rgba(56,208,255,.5); }
+  .wifi.lvl4 i:nth-child(-n+4){ background:var(--cyan);   box-shadow:0 0 6px rgba(56,208,255,.5); }
+  #rssitxt, #vstat { margin-left:auto; font-variant-numeric:tabular-nums; }
+
+  #rev { position:absolute; top:16px; left:50%; transform:translateX(-50%); color:var(--danger);
+    font-weight:800; letter-spacing:.34em; font-size:16px; text-shadow:0 0 16px rgba(255,59,48,.6);
+    opacity:0; transition:opacity .15s; border:1px solid rgba(255,59,48,.5); border-radius:999px;
+    padding:6px 16px; background:rgba(40,0,0,.35); }
+  #rev.on { opacity:1; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.4; } }
+
+  #gauges { left:50%; bottom:16px; transform:translateX(-50%); width:min(380px,76vw);
+    padding:7px 10px 8px; }
+  #ghead { display:flex; align-items:center; justify-content:space-between; gap:10px;
+    cursor:pointer; pointer-events:auto; user-select:none; }
+  #ghead .eyebrow { font-size:9px; }
+  #ghead .gchev { color:#9fb2bd; font-size:11px; line-height:1; transition:transform .2s; }
+  #gauges.collapsed { padding:6px 10px; }
+  #gauges.collapsed #ghead .gchev { transform:rotate(-90deg); }
+  #grows { display:grid; gap:6px; margin-top:7px; transition:opacity .15s; }
+  #gauges.collapsed #grows { display:none; }
+  .g { display:grid; grid-template-columns:26px 1fr 34px; align-items:center; gap:8px; }
+  .g .lbl { font-size:9.5px; letter-spacing:.1em; color:#9fb2bd; }
+  .g .val { font-size:10.5px; text-align:right; color:var(--cyan); font-variant-numeric:tabular-nums; }
+  .track { position:relative; height:7px; border-radius:5px; background:rgba(255,255,255,.08);
+    border:1px solid var(--hair); overflow:hidden; }
+  .fill { position:absolute; top:0; bottom:0; background:var(--cyan); border-radius:4px;
+    box-shadow:0 0 10px rgba(56,208,255,.5); transition:width .06s linear, left .06s linear; }
+  .center::after { content:""; position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:rgba(255,255,255,.55); }
+  .amber .fill { background:var(--amber); box-shadow:0 0 10px rgba(242,204,12,.45); }
+  /* Pill to restore the HUD when fully hidden */
+  #hudpill { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); pointer-events:auto;
+    display:none; background:var(--panel); border:1px solid var(--hair); color:#9fb2bd;
+    border-radius:999px; padding:5px 14px; font:11px var(--mono); letter-spacing:.16em;
+    cursor:pointer; backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+  body.hud-off #hud { display:none; }
+  body.hud-off #hudpill { display:block; }
+
+  /* Camera controls */
+  #cambtn, #full, #qrbtn { position:fixed; bottom:18px; pointer-events:auto; background:var(--panel);
+    border:1px solid var(--hair); color:#cfe0e9; border-radius:10px; padding:8px 12px; font:12px var(--mono);
+    cursor:pointer; letter-spacing:.08em; }
+  #cambtn { left:18px; }
+  #qrbtn { left:112px; }
+  #full { right:18px; }
+  #campanel { position:fixed; left:18px; bottom:58px; width:230px; pointer-events:auto; display:none; }
+  #campanel.open { display:block; }
+  #campanel .crow { display:flex; align-items:center; gap:10px; margin:8px 0; font-size:12px; }
+  #campanel .crow label { color:#9fb2bd; letter-spacing:.06em; min-width:54px; }
+  #campanel input[type=range] { flex:1; accent-color:var(--cyan); }
+  .toggle { margin-left:auto; cursor:pointer; border:1px solid var(--hair); border-radius:999px;
+    padding:3px 10px; color:#9fb2bd; letter-spacing:.1em; user-select:none; }
+  .toggle.on { color:var(--ink); background:var(--cyan); border-color:var(--cyan); font-weight:700; }
+
+  /* "Connect the phone" card: shown until video is actually playing */
+  #waiting { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    padding:24px; background:radial-gradient(80% 70% at 50% 40%, rgba(13,20,24,.94), rgba(5,7,8,.97)); }
+  #waiting .card { display:grid; grid-template-columns:auto 1fr; gap:26px; align-items:center;
+    max-width:860px; }
+  #qrbox { background:#fff; border-radius:14px; padding:10px; width:252px; height:252px;
+    display:flex; align-items:center; justify-content:center; }
+  #qrbox img { width:232px; height:232px; image-rendering:pixelated; }
+  #waiting h2 { margin:0 0 10px; font-size:22px; letter-spacing:.02em; }
+  #waiting h2 b { color:var(--amber); }
+  #purl { font-size:15px; color:var(--cyan); word-break:break-all; margin:6px 0 4px; user-select:all; }
+  #altUrls { font-size:12px; color:#8da0ab; }
+  #waiting ol { margin:12px 0; padding-left:20px; color:#b8c7cf; font-size:13px; line-height:1.65; }
+  #waiting a { color:var(--cyan); }
+  .stline { display:flex; align-items:center; gap:8px; font-size:13px; margin:5px 0; }
+  .small { font-size:12px; }
+  .hidden { display:none !important; }
+  #hud.stale { filter:saturate(.4) opacity(.75); }
+  @media (max-width:700px) { #waiting .card { grid-template-columns:1fr; justify-items:center; } }
+</style>
+</head>
+<body>
+  <video id="v" autoplay playsinline muted></video>
+  <div id="fx"></div>
+
+  <div id="hud" class="hidden">
+    <div id="rev">REVERSE</div>
+    <div class="panel" id="cluster">
+      <div id="gear">N</div>
+      <div class="meta"><div id="drv">neutral</div><div id="drvsub">drive state</div></div>
+    </div>
+    <div class="panel" id="status">
+      <div class="row"><span class="dot" id="dot"></span><span id="linktxt">link</span><span id="cam">REAR</span></div>
+      <div class="row"><span class="muted">wifi</span><span class="wifi" id="wifibars"><i></i><i></i><i></i><i></i></span><span id="rssitxt">— dBm</span></div>
+      <div class="row"><span class="muted">rate</span><span id="pps">— pps</span>
+        <span class="muted" style="margin-left:auto">lost</span><span id="lost">0</span></div>
+      <div class="row"><span class="muted">trim</span><span id="trim">+0 µs</span></div>
+      <div class="row"><span class="dot" id="vdot"></span><span class="muted">video</span><span id="vstat">—</span></div>
+    </div>
+    <div class="panel" id="gauges">
+      <div id="ghead" title="Collapse telemetry (T)"><span class="eyebrow">Telemetry</span><span class="gchev">▾</span></div>
+      <div id="grows">
+        <div class="g"><span class="lbl">STR</span><div class="track center"><div class="fill" id="f_str"></div></div><span class="val" id="v_str">0</span></div>
+        <div class="g"><span class="lbl">THR</span><div class="track center amber"><div class="fill" id="f_thr"></div></div><span class="val" id="v_thr">0</span></div>
+        <div class="g"><span class="lbl">BRK</span><div class="track"><div class="fill" id="f_brk" style="left:0"></div></div><span class="val" id="v_brk">0</span></div>
+        <div class="g"><span class="lbl">HB</span><div class="track"><div class="fill" id="f_hb" style="left:0"></div></div><span class="val" id="v_hb">0</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="waiting">
+    <div class="card">
+      <div id="qrbox"><img id="qr" alt="QR code for the phone page" /></div>
+      <div>
+        <h2>Cockpit ready — <b>connect the car camera</b></h2>
+        <div class="muted small">On the phone mounted in the car, open:</div>
+        <div id="purl">…</div>
+        <div id="altUrls"></div>
+        <ol>
+          <li>Phone on the <b>same WiFi</b> as this laptop and the car.</li>
+          <li>Scan the code (or type the address) → <b>Start streaming</b> → allow the camera.</li>
+          <li>Certificate warning? Tap <i>Advanced → Proceed</i> — or install
+              <a href="/ca.crt">this certificate</a> on the phone once to skip it forever.</li>
+        </ol>
+        <div class="stline"><span class="dot" id="w_phone"></span><span id="w_phone_t">phone: not connected</span></div>
+        <div class="stline"><span class="dot" id="w_video"></span><span id="w_video_t">video: waiting for the phone</span></div>
+        <div class="stline"><span class="dot" id="w_car"></span><span id="w_car_t">car: —</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="hudpill" title="Show HUD (H)">HUD</div>
+
+  <button id="cambtn">Camera</button>
+  <button id="qrbtn" title="Show the phone QR code (Q)">Phone</button>
+  <div class="panel" id="campanel">
+    <div class="crow" id="zoomrow" style="display:none">
+      <label>Zoom</label><input type="range" id="zoom" min="1" max="4" step="0.1" value="1" />
+    </div>
+    <div class="crow" id="torchrow" style="display:none">
+      <label>Torch</label><span class="toggle" id="torch">OFF</span>
+    </div>
+    <div class="crow"><label>Frame</label><span class="toggle on" id="frame">FILL</span></div>
+    <div class="crow"><label>Mirror</label><span class="toggle" id="mirror">OFF</span></div>
+    <div class="crow"><label>Flip</label><span class="toggle" id="flip">OFF</span></div>
+    <div class="crow" id="nocam" style="display:none; color:#6f818c">No zoom/torch on this camera.</div>
+  </div>
+
+  <button id="full">Fullscreen</button>
+
+<script>
+const v = document.getElementById("v");
+const hud = document.getElementById("hud");
+const waiting = document.getElementById("waiting");
+let ws, pc, pendingIce = [], lastTele = 0;
+let mirror = false, flip = false;
+let status = null, qrUrl = null;
+let videoPlaying = false, qrForced = false;
+let restartTimer = null, lastRestartAt = 0, lastFrames = 0, frozenSince = 0;
+let lastBytes = 0, lastStatsAt = 0, lastDiagAt = 0, videoText = "waiting for the phone";
+
+const el = (id) => document.getElementById(id);
+function setDot(id, cls) { el(id).className = "dot" + (cls ? " " + cls : ""); }
+
+function setCentered(fill, val) {
+  const x = Math.max(-1, Math.min(1, val));
+  if (x >= 0) { fill.style.left = "50%"; fill.style.width = (x * 50) + "%"; }
+  else { fill.style.left = (50 + x * 50) + "%"; fill.style.width = (-x * 50) + "%"; }
+}
+function setLeft(fill, val) { fill.style.width = Math.max(0, Math.min(1, val)) * 100 + "%"; }
+
+function applyTransform() {
+  v.style.transform = `scaleX(${mirror ? -1 : 1}) scaleY(${flip ? -1 : 1})`;
+}
+
+// The overlay stays up until video frames are actually playing (not just until
+// telemetry arrives, which used to hide it and leave a silent black screen).
+function updateOverlay() {
+  waiting.classList.toggle("hidden", videoPlaying && !qrForced);
+}
+
+function onTelemetry(d) {
+  lastTele = performance.now();
+  hud.classList.remove("hidden");
+
+  const rev = d.gear === 6 || d.gear === 7;
+  const gearEl = el("gear");
+  gearEl.textContent = d.gear === 0 ? "N" : d.gear === 6 ? "R" : d.gear === 7 ? "r2" : String(d.gear);
+  gearEl.classList.toggle("rev", rev);
+  el("drv").textContent = d.drvName;
+  el("rev").classList.toggle("on", rev);
+
+  el("dot").className = "dot " + (d.link ? "live" : "warn");
+  el("linktxt").textContent = d.link ? "live" : "no signal";
+
+  const rssi = (typeof d.rssi === "number") ? d.rssi : 0;
+  const hasSignal = d.link && rssi < 0;       // 0 dBm = car not connected
+  let lvl = 0;
+  if (hasSignal) {
+    if (rssi >= -55) lvl = 4;
+    else if (rssi >= -65) lvl = 3;
+    else if (rssi >= -75) lvl = 2;
+    else lvl = 1;
+  }
+  el("wifibars").className = "wifi lvl" + lvl;
+  el("rssitxt").textContent = hasSignal ? rssi + " dBm" : "— dBm";
+
+  el("pps").textContent = d.pps + " pps";
+  el("lost").textContent = d.lost;
+  el("trim").textContent = (d.trim >= 0 ? "+" : "") + d.trim + " µs";
+
+  const cam = el("cam");
+  cam.textContent = rev ? "FRONT" : "REAR";
+  cam.classList.toggle("front", rev);
+
+  const steer = d.steer / 1000, thr = d.escOff / 500, brk = d.brake / 1000, hb = d.handbrake / 1000;
+  setCentered(el("f_str"), steer);
+  setCentered(el("f_thr"), thr);
+  setLeft(el("f_brk"), brk);
+  setLeft(el("f_hb"), hb);
+  el("v_str").textContent = Math.round(Math.abs(steer) * 100);
+  el("v_thr").textContent = Math.round(Math.abs(thr) * 100);
+  el("v_brk").textContent = Math.round(brk * 100);
+  el("v_hb").textContent = Math.round(hb * 100);
+}
+
+function onStatus(s) {
+  status = s;
+  const urls = s.phoneUrls || [];
+  if (urls.length) {
+    el("purl").textContent = urls[0].url;
+    el("altUrls").textContent = urls.length > 1
+      ? "other addresses: " + urls.slice(1).map(u => u.url.replace("https://", "")).join("  ·  ") : "";
+    if (urls[0].url !== qrUrl) { qrUrl = urls[0].url; el("qr").src = "/qr.svg?i=0&t=" + Date.now(); }
+  } else {
+    el("purl").textContent = "laptop has no LAN connection — join the car's WiFi";
+    el("altUrls").textContent = "";
+  }
+  setDot("w_phone", s.phone ? "live" : null);
+  el("w_phone_t").textContent = s.phone ? `phone: connected (${s.phoneAddr || "?"})` : "phone: not connected";
+
+  const car = s.car;
+  if (!car) { setDot("w_car", "warn"); el("w_car_t").textContent = "car: wheel reader not running"; }
+  else if (car.state === "live") { setDot("w_car", "live"); el("w_car_t").textContent = `car: live at ${car.ip} (found via ${car.via})`; }
+  else if (car.state === "searching") { setDot("w_car", "wait"); el("w_car_t").textContent = "car: searching the network…"; }
+  else { setDot("w_car", "wait"); el("w_car_t").textContent = `car: ${car.state}${car.ip ? " at " + car.ip : ""}`; }
+  if (!s.phone && !videoPlaying) setVideo("waiting for the phone", null);
+}
+
+function setVideo(text, cls) {
+  videoText = text;
+  el("w_video_t").textContent = "video: " + text;
+  setDot("w_video", cls);
+  setDot("vdot", cls);
+  if (!/fps/.test(text)) el("vstat").textContent = text;
+}
+
+setInterval(() => {
+  const stale = performance.now() - lastTele > 600;
+  hud.classList.toggle("stale", stale && lastTele !== 0);
+}, 200);
+
+function diag(msg) { send({ type:"diag", msg }); }
+
+function connect() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({ type:"hello", role:"viewer" }));
+  ws.onclose = () => { setVideo("laptop server not running", "warn"); setTimeout(connect, 1000); };
+  ws.onmessage = async (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.type === "offer") await answer(d.sdp);
+    else if (d.type === "ice") {
+      if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(d.candidate); } catch (e) {} }
+      else pendingIce.push(d.candidate);
+    } else if (d.type === "telemetry") onTelemetry(d);
+    else if (d.type === "camcaps") onCamCaps(d);
+    else if (d.type === "status") onStatus(d);
+  };
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// Ask the phone for a fresh offer, at most every 4 s.
+function requestRestart(reason, delay) {
+  if (restartTimer) return;
+  const wait = Math.max(delay, lastRestartAt + 4000 - performance.now());
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (pc && pc.connectionState === "connected" && !frozenSince) return;
+    lastRestartAt = performance.now();
+    diag("video restart: " + reason);
+    send({ type:"restart" });
+  }, Math.max(0, wait));
+}
+
+async function answer(offer) {
+  if (pc) pc.close();
+  pendingIce = [];
+  videoPlaying = false; frozenSince = 0; lastFrames = 0; lastBytes = 0;
+  updateOverlay();
+  setVideo("connecting…", "wait");
+  pc = new RTCPeerConnection({ iceServers: [] });
+  const thisPc = pc;
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type:"ice", candidate:e.candidate }); };
+  pc.ontrack = (e) => {
+    v.srcObject = e.streams[0] || new MediaStream([e.track]);
+    try { e.receiver.playoutDelayHint = 0; } catch (err) {}
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc !== thisPc) return;
+    const s = pc.connectionState;
+    diag("video connection: " + s);
+    if (s === "connected") setVideo("connected, waiting for frames", "wait");
+    else if (s === "failed") {
+      setVideo("connection failed — retrying (same WiFi? firewall?)", "warn");
+      videoPlaying = false; updateOverlay();
+      requestRestart("connection failed", 500);
+    } else if (s === "disconnected") {
+      setVideo("interrupted…", "warn");
+      requestRestart("disconnected", 4000);
+    }
+  };
+  await pc.setRemoteDescription(offer);
+  for (const c of pendingIce) { try { await pc.addIceCandidate(c); } catch (e) {} }
+  pendingIce = [];
+  const ans = await pc.createAnswer();
+  await pc.setLocalDescription(ans);
+  send({ type:"answer", sdp:pc.localDescription });
+}
+
+v.addEventListener("playing", () => { videoPlaying = true; updateOverlay(); });
+
+// Once a second: real frame stats. "Connected" isn't enough — frames must flow.
+setInterval(async () => {
+  if (!pc || pc.connectionState !== "connected") return;
+  let inb = null;
+  try {
+    const stats = await pc.getStats();
+    stats.forEach((r) => { if (r.type === "inbound-rtp" && r.kind === "video") inb = r; });
+  } catch (e) { return; }
+  if (!inb) return;
+  const now = performance.now();
+  const kbps = lastStatsAt ? Math.round((inb.bytesReceived - lastBytes) * 8 / (now - lastStatsAt)) : 0;
+  lastBytes = inb.bytesReceived; lastStatsAt = now;
+  const frames = inb.framesDecoded || 0;
+  if (frames > lastFrames) {
+    frozenSince = 0;
+    const fps = Math.round(inb.framesPerSecond || 0);
+    const res = inb.frameWidth ? `${inb.frameWidth}×${inb.frameHeight}` : "";
+    const txt = `${fps} fps · ${(kbps / 1000).toFixed(1)} Mbps · ${res}`;
+    el("vstat").textContent = `${fps} fps · ${(kbps / 1000).toFixed(1)} Mbps`;
+    setVideo(txt, "live");
+    if (!videoPlaying && v.readyState >= 2) { videoPlaying = true; updateOverlay(); }
+    if (now - lastDiagAt > 30000) { lastDiagAt = now; diag("video OK: " + txt); }
+  } else {
+    if (!frozenSince) frozenSince = now;
+    if (now - frozenSince > 5000) {
+      setVideo("frozen — no frames for 5 s, reconnecting", "warn");
+      videoPlaying = false; updateOverlay();
+      requestRestart("no frames for 5 s", 0);
+    } else setVideo("connected, but no frames yet", "wait");
+  }
+  lastFrames = frames;
+}, 1000);
+
+function onCamCaps(d) {
+  const z = el("zoomrow"), t = el("torchrow"), none = el("nocam");
+  if (d.zoom) {
+    z.style.display = "flex";
+    el("zoom").min = d.zoom.min; el("zoom").max = d.zoom.max; el("zoom").step = d.zoom.step;
+  } else z.style.display = "none";
+  t.style.display = d.torch ? "flex" : "none";
+  none.style.display = (!d.zoom && !d.torch) ? "block" : "none";
+  if (!d.torch) { el("torch").classList.remove("on"); el("torch").textContent = "OFF"; }
+}
+
+// Camera panel
+el("cambtn").onclick = () => el("campanel").classList.toggle("open");
+el("qrbtn").onclick = () => { qrForced = !qrForced; updateOverlay(); };
+waiting.onclick = (e) => { if (e.target === waiting && videoPlaying) { qrForced = false; updateOverlay(); } };
+el("zoom").oninput = (e) => send({ type:"cam", zoom: parseFloat(e.target.value) });
+el("torch").onclick = () => {
+  const on = !el("torch").classList.contains("on");
+  el("torch").classList.toggle("on", on); el("torch").textContent = on ? "ON" : "OFF";
+  send({ type:"cam", torch: on });
+};
+// Portrait-mounted phone on a landscape screen: FILL (cover) shows full width and
+// crops the tall edges for an immersive forward view; FIT (contain) shows the whole
+// portrait frame pillarboxed. Pair FILL with the phone's ultra-wide lens.
+el("frame").onclick = () => {
+  const fill = el("frame").textContent !== "FILL"; // currently FIT -> go back to FILL
+  el("frame").textContent = fill ? "FILL" : "FIT";
+  el("frame").classList.toggle("on", fill);
+  v.style.objectFit = fill ? "cover" : "contain";
+};
+el("mirror").onclick = () => {
+  mirror = !mirror; el("mirror").classList.toggle("on", mirror); el("mirror").textContent = mirror ? "ON" : "OFF";
+  applyTransform();
+};
+el("flip").onclick = () => {
+  flip = !flip; el("flip").classList.toggle("on", flip); el("flip").textContent = flip ? "ON" : "OFF";
+  applyTransform();
+};
+el("full").onclick = () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+  else document.exitFullscreen();
+};
+
+// Telemetry collapse (T) — persisted
+const gauges = el("gauges");
+function setTelem(collapsed) {
+  gauges.classList.toggle("collapsed", collapsed);
+  try { localStorage.setItem("hud.telem", collapsed ? "1" : "0"); } catch (e) {}
+}
+el("ghead").onclick = () => setTelem(!gauges.classList.contains("collapsed"));
+try { if (localStorage.getItem("hud.telem") === "1") gauges.classList.add("collapsed"); } catch (e) {}
+
+// Full HUD hide (H) — persisted, restored via the corner pill
+function setHud(off) {
+  document.body.classList.toggle("hud-off", off);
+  try { localStorage.setItem("hud.off", off ? "1" : "0"); } catch (e) {}
+}
+el("hudpill").onclick = () => setHud(false);
+try { if (localStorage.getItem("hud.off") === "1") document.body.classList.add("hud-off"); } catch (e) {}
+
+// Keyboard: H hide/show HUD, T telemetry, C camera, M mirror, F fullscreen, Q phone QR
+addEventListener("keydown", (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  switch (e.key.toLowerCase()) {
+    case "h": setHud(!document.body.classList.contains("hud-off")); break;
+    case "t": setTelem(!gauges.classList.contains("collapsed")); break;
+    case "c": el("campanel").classList.toggle("open"); break;
+    case "m": el("mirror").click(); break;
+    case "f": el("full").click(); break;
+    case "q": el("qrbtn").click(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+fetch("/api/status").then(r => r.json()).then(onStatus).catch(() => {});
+connect();
+</script>
+</body>
+</html>

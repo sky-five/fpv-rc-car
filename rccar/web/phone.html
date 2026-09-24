@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#07090a" />
+<title>RC Car — Camera</title>
+<style>
+  :root { --amber:#f2cc0c; --cyan:#38d0ff; --danger:#ff3b30; --ink:#07090a; --panel:rgba(8,12,16,.62); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--ink); color:#eaf2f6;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; overflow:hidden; }
+  #preview { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+  #scrim { position:fixed; inset:0; pointer-events:none;
+    background:radial-gradient(120% 80% at 50% 0%, transparent 40%, rgba(0,0,0,.55) 100%); }
+  .bar { position:fixed; left:0; right:0; padding:14px 16px; display:flex; align-items:center; gap:12px;
+    backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+  #top { top:0; background:linear-gradient(180deg,var(--panel),transparent); }
+  #bottom { bottom:0; background:linear-gradient(0deg,var(--panel),transparent); justify-content:space-between; flex-wrap:wrap; }
+  .tag { font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--cyan); }
+  .dot { width:9px; height:9px; border-radius:50%; background:#555; box-shadow:0 0 8px #555; }
+  .dot.live { background:var(--cyan); box-shadow:0 0 10px var(--cyan); }
+  .dot.warn { background:var(--danger); box-shadow:0 0 10px var(--danger); }
+  #cam { font-weight:700; letter-spacing:.16em; font-size:13px; padding:4px 10px;
+    border:1px solid var(--cyan); border-radius:999px; color:var(--cyan); }
+  #cam.front { color:var(--danger); border-color:var(--danger); }
+  select { background:rgba(0,0,0,.4); color:#eaf2f6; border:1px solid rgba(255,255,255,.22);
+    border-radius:8px; padding:8px 10px; font:inherit; }
+  #gate { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:22px; text-align:center; background:radial-gradient(80% 60% at 50% 35%,#0d1418,#050708); padding:28px; }
+  #gate h1 { margin:0; font-size:22px; letter-spacing:.04em; }
+  #gate h1 b { color:var(--amber); }
+  #gate p { margin:0; max-width:32ch; color:#9fb2bd; font-size:14px; line-height:1.5; }
+  #gate a { color:var(--cyan); }
+  #go { border:none; border-radius:14px; padding:18px 34px; background:var(--amber); color:#1a1500;
+    font:700 17px/1 ui-monospace,monospace; letter-spacing:.04em; cursor:pointer; box-shadow:0 10px 30px rgba(242,204,12,.25); }
+  #go:active { transform:translateY(1px); }
+  .hidden { display:none !important; }
+  #revflash { position:fixed; top:64px; left:50%; transform:translateX(-50%); color:var(--danger);
+    font-weight:700; letter-spacing:.28em; font-size:15px; text-shadow:0 0 14px rgba(255,59,48,.6); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+</style>
+</head>
+<body>
+  <video id="preview" autoplay playsinline muted></video>
+  <div id="scrim"></div>
+  <div id="revflash" class="hidden">REVERSE — REAR VIEW</div>
+
+  <div id="top" class="bar">
+    <span class="dot" id="dot"></span>
+    <span class="tag" id="state">connecting</span>
+    <span style="flex:1"></span>
+    <span class="tag" id="g">G —</span>
+    <span id="cam">REAR</span>
+  </div>
+
+  <div id="bottom" class="bar">
+    <span class="tag">Lens</span>
+    <select id="lens" title="Back camera lens — pick the widest"><option value="">auto</option></select>
+    <span class="tag">Quality</span>
+    <select id="quality">
+      <option value="1080">1080p · 6 Mbps</option>
+      <option value="720" selected>720p · 3 Mbps</option>
+      <option value="480">480p · 1.2 Mbps</option>
+    </select>
+    <span class="tag" id="res">—</span>
+  </div>
+
+  <div id="gate">
+    <h1>RC Car <b>Camera</b></h1>
+    <p>Mount faces forward. The rear camera streams the driving view; reverse gear flips to the front camera so you can see behind.</p>
+    <button id="go">Start streaming</button>
+    <p id="err" style="color:var(--danger)"></p>
+    <p style="font-size:12px">Tired of the certificate warning? <a href="/ca.crt">Download this certificate</a>, then
+      Settings → Security → Encryption &amp; credentials → Install a certificate → CA certificate.</p>
+  </div>
+
+<script>
+const QUAL = {
+  "1080": { w:1920, h:1080, br:6000000 },
+  "720":  { w:1280, h:720,  br:3000000 },
+  "480":  { w:854,  h:480,  br:1200000 },
+};
+
+const preview = document.getElementById("preview");
+const gate = document.getElementById("gate");
+const goBtn = document.getElementById("go");
+const errEl = document.getElementById("err");
+const stateEl = document.getElementById("state");
+const dotEl = document.getElementById("dot");
+const camEl = document.getElementById("cam");
+const resEl = document.getElementById("res");
+const qualitySel = document.getElementById("quality");
+const lensSel = document.getElementById("lens");
+const revFlash = document.getElementById("revflash");
+
+let ws, pc, videoSender, localStream;
+let curFacing = "environment";   // rear camera = forward driving view
+let curQuality = "720";
+let switching = false, wakeLock = null, pendingIce = [];
+let camIds = { user:null, environment:null };
+let backCams = [];                                          // all environment-facing lenses
+let selectedBackId = null;
+try { selectedBackId = localStorage.getItem("rc_back_lens"); } catch (e) {}
+let desiredZoom = null, desiredTorch = false;
+
+// Camera follows the gear, but only once the wanted camera has been stable for
+// GEAR_SETTLE_MS (the H-shifter passes through neutral), and never faster than
+// SWITCH_BACKOFF_MS after a failed switch (the old code retried at 10 Hz).
+const GEAR_SETTLE_MS = 250, SWITCH_BACKOFF_MS = 2000;
+let wantFacing = "environment", wantSince = 0, backoffUntil = 0;
+
+function diag(msg) { send({ type:"diag", msg }); }
+
+// Phone mounted PORTRAIT but the cockpit screen is LANDSCAPE: the capture is tall
+// and narrow, so the forward view looks zoomed-in. The fix is to shoot the widest
+// back lens (ultra-wide) — that buys back horizontal field of view. Label-based
+// guess for the default; the dropdown lets you override per device (labels vary).
+function guessUltraWide(cams) {
+  const wide = cams.find(c => /(ultra|wide|uw|0\.5|0,5)/i.test(c.label || ""));
+  return wide ? wide.deviceId : (cams[0] ? cams[0].deviceId : null);
+}
+
+function setState(txt, cls) { stateEl.textContent = txt; dotEl.className = "dot" + (cls ? " " + cls : ""); }
+
+async function refreshCamIds() {
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const vids = devs.filter(x => x.kind === "videoinput");
+    backCams = [];
+    for (const d of vids) {
+      const l = (d.label || "").toLowerCase();
+      if (/front|user|face|selfie/.test(l)) { if (!camIds.user) camIds.user = d.deviceId; continue; }
+      // Treat everything that isn't clearly front-facing as a usable rear lens.
+      backCams.push({ deviceId: d.deviceId, label: d.label || `Back cam ${backCams.length + 1}` });
+      if (!camIds.environment && /back|rear|environment|world|main/.test(l)) camIds.environment = d.deviceId;
+    }
+    if (!camIds.environment && backCams[0]) camIds.environment = backCams[0].deviceId;
+    // Keep a valid rear lens selected: persisted choice if still present, else ultra-wide guess.
+    if (!selectedBackId || !backCams.some(c => c.deviceId === selectedBackId)) {
+      selectedBackId = guessUltraWide(backCams);
+    }
+    populateLensDropdown();
+  } catch (e) {}
+}
+
+function populateLensDropdown() {
+  lensSel.innerHTML = "";
+  backCams.forEach((c, i) => {
+    const o = document.createElement("option");
+    o.value = c.deviceId;
+    // Strip Chrome's "camera2 N, facing back" noise down to something tappable.
+    o.textContent = c.label.replace(/^camera2\s*/i, "").replace(/,?\s*facing back/i, "").trim() || `Lens ${i + 1}`;
+    if (c.deviceId === selectedBackId) o.selected = true;
+    lensSel.appendChild(o);
+  });
+  if (!backCams.length) {
+    const o = document.createElement("option"); o.value = ""; o.textContent = "auto"; lensSel.appendChild(o);
+  }
+}
+
+function facingOf(stream) {
+  const t = stream && stream.getVideoTracks()[0];
+  const s = t && t.getSettings ? t.getSettings() : {};
+  return s.facingMode || null;   // not every browser reports it
+}
+
+// Open a camera for `facing`. deviceId first (reliable on Android), then exact
+// facingMode, then ideal. If the browser reports the camera's facing and it's
+// wrong (facingMode:{ideal} can silently hand back the other camera), try the next
+// option instead of streaming the wrong view.
+async function getCamera(facing) {
+  const q = QUAL[curQuality];
+  const base = { width:{ideal:q.w}, height:{ideal:q.h}, frameRate:{ideal:30} };
+  const targetId = (facing === "environment" && selectedBackId) ? selectedBackId : camIds[facing];
+  const attempts = [];
+  if (targetId) attempts.push({ ...base, deviceId:{ exact:targetId } });
+  attempts.push({ ...base, facingMode:{ exact:facing } });
+  attempts.push({ ...base, facingMode:{ ideal:facing } });
+  let lastErr = null, fallback = null;
+  for (const video of attempts) {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio:false, video }); }
+    catch (e) { lastErr = e; continue; }
+    const got = facingOf(stream);
+    if (!got || got === facing) {
+      const t = stream.getVideoTracks()[0];
+      if (t) t.contentHint = "motion";   // favor motion clarity (FPV driving scene)
+      if (fallback) fallback.getTracks().forEach(t => t.stop());
+      return stream;
+    }
+    diag(`asked for ${facing} camera, got ${got}; trying another way`);
+    if (!fallback) fallback = stream; else stream.getTracks().forEach(t => t.stop());
+  }
+  if (fallback) return fallback;          // wrong camera beats no camera
+  throw lastErr || new Error("no camera");
+}
+
+function updateCamLabel() {
+  const front = curFacing === "user";
+  camEl.textContent = front ? "FRONT" : "REAR";
+  camEl.classList.toggle("front", front);
+  revFlash.classList.toggle("hidden", !front);
+  const t = localStream && localStream.getVideoTracks()[0];
+  const s = t && t.getSettings ? t.getSettings() : {};
+  if (s.width) resEl.textContent = `${s.width}×${s.height}`;
+}
+
+// Apply zoom / torch to the live track (best effort) and report what's available.
+async function applyCam() {
+  const track = localStream && localStream.getVideoTracks()[0];
+  if (!track || !track.getCapabilities) return;
+  const caps = track.getCapabilities();
+  const adv = [];
+  if (caps.zoom && desiredZoom != null) {
+    const z = Math.max(caps.zoom.min, Math.min(caps.zoom.max, desiredZoom));
+    adv.push({ zoom: z });
+  }
+  if ("torch" in caps) adv.push({ torch: !!desiredTorch });
+  if (adv.length) { try { await track.applyConstraints({ advanced: adv }); } catch (e) {} }
+}
+
+function reportCaps() {
+  const track = localStream && localStream.getVideoTracks()[0];
+  const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+  send({
+    type: "camcaps",
+    zoom: caps.zoom ? { min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1 } : null,
+    torch: ("torch" in caps),
+  });
+}
+
+async function requestWakeLock() { try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && wakeLock === null) requestWakeLock();
+});
+
+async function start() {
+  errEl.textContent = "";
+  try { localStream = await getCamera(curFacing); }
+  catch (e) {
+    errEl.textContent = "Camera blocked: " + e.message +
+      ". Accept the certificate (https) and grant camera permission.";
+    return;
+  }
+  preview.srcObject = localStream;
+  await refreshCamIds();         // labels are available now that permission is granted
+  updateCamLabel();
+  requestWakeLock();
+  gate.classList.add("hidden");
+  connect();
+}
+
+function connect() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.onopen = () => { setState("waiting for cockpit", null); ws.send(JSON.stringify({ type:"hello", role:"phone" })); };
+  ws.onclose = () => { setState("laptop unreachable — retrying", "warn"); setTimeout(connect, 1000); };
+  ws.onmessage = async (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.type === "start") { negotiate(); reportCaps(); }
+    else if (d.type === "answer") {
+      if (!pc) return;
+      await pc.setRemoteDescription(d.sdp);
+      for (const c of pendingIce) { try { await pc.addIceCandidate(c); } catch (e) {} }
+      pendingIce = [];
+    } else if (d.type === "ice") {
+      if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(d.candidate); } catch (e) {} }
+      else pendingIce.push(d.candidate);
+    } else if (d.type === "telemetry") onTelemetry(d);
+    else if (d.type === "cam") {
+      if ("zoom" in d) desiredZoom = d.zoom;
+      if ("torch" in d) desiredTorch = d.torch;
+      applyCam();
+    }
+  };
+}
+
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// Prefer the phone's hardware H.264 encoder over software VP8: lower encode latency,
+// less battery, and less heat (heat causes thermal throttling that degrades a long stream).
+function preferH264(pc, sender) {
+  try {
+    const caps = RTCRtpSender.getCapabilities("video");
+    if (!caps || !caps.codecs) return;
+    const h264 = caps.codecs.filter(c => /h264/i.test(c.mimeType));
+    if (!h264.length) return;
+    const rest = caps.codecs.filter(c => !/h264/i.test(c.mimeType));
+    const tx = pc.getTransceivers().find(t => t.sender === sender);
+    if (tx && tx.setCodecPreferences) tx.setCodecPreferences([...h264, ...rest]);
+  } catch (e) {}
+}
+
+async function negotiate() {
+  if (!localStream) return;
+  if (pc) pc.close();
+  pendingIce = [];
+  setState("connecting video…", null);
+  pc = new RTCPeerConnection({ iceServers: [] });
+  const thisPc = pc;
+  pc.onicecandidate = (e) => { if (e.candidate) send({ type:"ice", candidate:e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (pc !== thisPc) return;
+    const s = pc.connectionState;
+    diag("video connection: " + s);
+    if (s === "connected") setState("streaming", "live");
+    else if (s === "failed" || s === "disconnected") setState(s + " — cockpit will retry", "warn");
+  };
+  const track = localStream.getVideoTracks()[0];
+  videoSender = pc.addTrack(track, localStream);
+  preferH264(pc, videoSender);
+  await applyBitrate();
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type:"offer", sdp:pc.localDescription });
+}
+
+async function applyBitrate() {
+  if (!videoSender) return;
+  const p = videoSender.getParameters();
+  if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = QUAL[curQuality].br;
+  p.degradationPreference = "maintain-framerate";
+  try { await videoSender.setParameters(p); } catch (e) {}
+}
+
+// Swap the live track for a new stream (camera flip, lens or quality change).
+async function useStream(newStream) {
+  const newTrack = newStream.getVideoTracks()[0];
+  if (videoSender) await videoSender.replaceTrack(newTrack);
+  if (localStream && localStream !== newStream) localStream.getTracks().forEach((t) => t.stop());
+  localStream = newStream;
+  preview.srcObject = localStream;
+  await applyBitrate();
+  await applyCam();
+  reportCaps();
+  updateCamLabel();
+}
+
+async function switchCamera(facing) {
+  if (switching || facing === curFacing) return;
+  switching = true;
+  setState("switching camera…", null);
+  // Most phones can't hold two cameras open, so release the current one first
+  // (a brief freeze on the cockpit) instead of timing out trying both.
+  try { localStream.getVideoTracks().forEach((t) => t.stop()); } catch (e) {}
+  try {
+    const s = await getCamera(facing);
+    curFacing = facing;
+    await useStream(s);
+    setState("streaming", "live");
+  } catch (e) {
+    diag(`camera switch to ${facing} failed: ${e.message}`);
+    setState("cam switch failed", "warn");
+    backoffUntil = performance.now() + SWITCH_BACKOFF_MS;
+    try { await useStream(await getCamera(curFacing)); } catch (e2) {}   // get the old view back
+  } finally {
+    switching = false;
+  }
+}
+
+function onTelemetry(d) {
+  document.getElementById("g").textContent = "G " +
+    (d.gear === 6 ? "R" : d.gear === 7 ? "r2" : d.gear);
+  // Gears 6 (R) and 7 (r2) are both reverse -> front camera (faces rearward on the car).
+  const want = (d.gear === 6 || d.gear === 7) ? "user" : "environment";
+  if (want !== wantFacing) { wantFacing = want; wantSince = performance.now(); }
+}
+
+setInterval(() => {
+  if (!localStream || switching || wantFacing === curFacing) return;
+  const now = performance.now();
+  if (now - wantSince >= GEAR_SETTLE_MS && now >= backoffUntil) switchCamera(wantFacing);
+}, 50);
+
+async function restream() {
+  try { localStream.getVideoTracks().forEach((t) => t.stop()); } catch (e) {}
+  await useStream(await getCamera(curFacing));
+}
+
+qualitySel.onchange = async () => {
+  curQuality = qualitySel.value;
+  try { await restream(); } catch (e) { setState("quality change failed", "warn"); }
+};
+
+lensSel.onchange = async () => {
+  selectedBackId = lensSel.value || null;
+  try {
+    if (selectedBackId) localStorage.setItem("rc_back_lens", selectedBackId);
+    else localStorage.removeItem("rc_back_lens");
+  } catch (e) {}
+  if (curFacing !== "environment" || !localStream) return;   // only the rear view uses the lens picker
+  try { await restream(); } catch (e) { setState("lens switch failed", "warn"); }
+};
+
+goBtn.onclick = start;
+</script>
+</body>
+</html>

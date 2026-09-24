@@ -1,0 +1,39 @@
+# ---- Secrets: never commit ------------------------------------------------
+# Firmware WiFi credentials (and optional OTA password). Copy the example:
+#   firmware/car_link_rx/secrets.h.example -> firmware/car_link_rx/secrets.h
+secrets.h
+!secrets.h.example
+
+# Local runtime state: TLS certs (incl. the CA private key) and the car IP cache.
+# Regenerated automatically.
+.rccar/
+cert.pem
+key.pem
+*.pem
+*.key
+*.crt
+
+# Per-drive diagnostic logs (rccar/g29_reader.py, tools/analyze_log.py) — local only
+logs/
+
+# Build output (tools/flash.py compiles the firmware here)
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Arduino / ESP32 build artifacts
+*.ino.bin
+*.ino.elf
+*.ino.map
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
