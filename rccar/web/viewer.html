@@ -12,7 +12,9 @@
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; background:#000; color:#eaf2f6; font-family:var(--mono); overflow:hidden; }
-  #v { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; transition:transform .15s; }
+  /* Centered so it can be rotated; applyTransform() swaps width/height at 90/270. */
+  #v { position:fixed; top:50%; left:50%; width:100vw; height:100vh; object-fit:cover; background:#000;
+    transform:translate(-50%,-50%); transition:transform .15s; }
   #fx { position:fixed; inset:0; pointer-events:none; mix-blend-mode:soft-light;
     background:radial-gradient(130% 90% at 50% 50%, transparent 55%, rgba(0,0,0,.7) 100%); }
   #hud { position:fixed; inset:0; pointer-events:none; }
@@ -186,6 +188,7 @@
     </div>
     <div class="crow"><label>Frame</label><span class="toggle on" id="frame">FILL</span></div>
     <div class="crow"><label>Mirror</label><span class="toggle" id="mirror">OFF</span></div>
+    <div class="crow"><label>Rotate</label><span class="toggle" id="rotate" title="Rotate 90° (R)">0°</span></div>
     <div class="crow"><label>Flip</label><span class="toggle" id="flip">OFF</span></div>
     <div class="crow" id="nocam" style="display:none; color:#6f818c">No zoom/torch on this camera.</div>
   </div>
@@ -213,8 +216,20 @@ function setCentered(fill, val) {
 }
 function setLeft(fill, val) { fill.style.width = Math.max(0, Math.min(1, val)) * 100 + "%"; }
 
+// Rotation fixes a phone mounted in a different orientation than the picture
+// arrives in (persisted per laptop). At 90/270 the box is swapped so the rotated
+// video still fills the screen.
+let rotation = 0;
+try { rotation = parseInt(localStorage.getItem("cam.rot") || "0", 10) % 360 || 0; } catch (e) {}
+
 function applyTransform() {
-  v.style.transform = `scaleX(${mirror ? -1 : 1}) scaleY(${flip ? -1 : 1})`;
+  const side = rotation === 90 || rotation === 270;
+  v.style.width = side ? "100vh" : "100vw";
+  v.style.height = side ? "100vw" : "100vh";
+  v.style.transform = `translate(-50%,-50%) rotate(${rotation}deg) ` +
+                      `scaleX(${mirror ? -1 : 1}) scaleY(${flip ? -1 : 1})`;
+  const r = document.getElementById("rotate");
+  if (r) { r.textContent = rotation + "°"; r.classList.toggle("on", rotation !== 0); }
 }
 
 // The overlay stays up until video frames are actually playing (not just until
@@ -444,6 +459,12 @@ el("flip").onclick = () => {
   flip = !flip; el("flip").classList.toggle("on", flip); el("flip").textContent = flip ? "ON" : "OFF";
   applyTransform();
 };
+el("rotate").onclick = () => {
+  rotation = (rotation + 90) % 360;
+  try { localStorage.setItem("cam.rot", String(rotation)); } catch (e) {}
+  applyTransform();
+};
+applyTransform();
 el("full").onclick = () => {
   if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
   else document.exitFullscreen();
@@ -466,11 +487,12 @@ function setHud(off) {
 el("hudpill").onclick = () => setHud(false);
 try { if (localStorage.getItem("hud.off") === "1") document.body.classList.add("hud-off"); } catch (e) {}
 
-// Keyboard: H hide/show HUD, T telemetry, C camera, M mirror, F fullscreen, Q phone QR
+// Keyboard: H hide/show HUD, T telemetry, C camera, M mirror, R rotate, F fullscreen, Q phone QR
 addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   switch (e.key.toLowerCase()) {
     case "h": setHud(!document.body.classList.contains("hud-off")); break;
+    case "r": el("rotate").click(); break;
     case "t": setTelem(!gauges.classList.contains("collapsed")); break;
     case "c": el("campanel").classList.toggle("open"); break;
     case "m": el("mirror").click(); break;
