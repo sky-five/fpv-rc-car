@@ -130,10 +130,17 @@ class Inputs:
         self.gear = 0
         self.hb_btn = self.trim_l = self.trim_r = self.trim_rst = 0
 
-    def read(self, wheel, handbrake):
+    def read(self, wheel, handbrake, moved):
+        """moved: (device instance id, axis) pairs that have reported motion.
+
+        pygame reports an axis as 0.0 until the device sends its first update, and
+        0.0 maps to a HALF-pressed pedal. Treat untouched pedals as released, or
+        shifting into gear before touching the gas would send 50% throttle.
+        """
+        wid = wheel.get_instance_id()
         self.steer = norm_steer(wheel.get_axis(AX_STEER))
-        gas = norm_pedal(wheel.get_axis(AX_GAS))
-        self.brake = norm_pedal(wheel.get_axis(AX_BRAKE))
+        gas = norm_pedal(wheel.get_axis(AX_GAS)) if (wid, AX_GAS) in moved else 0.0
+        self.brake = norm_pedal(wheel.get_axis(AX_BRAKE)) if (wid, AX_BRAKE) in moved else 0.0
         self.gear = read_gear_code(wheel)
         self.trim_l, self.trim_r, self.trim_rst = read_trim(wheel)
         if self.gear in protocol.REVERSE_GEARS:
@@ -143,7 +150,8 @@ class Inputs:
         else:
             self.drive = gas
         if handbrake is not None:
-            self.hb = norm_handbrake(handbrake.get_axis(HB_AXIS))
+            hid = handbrake.get_instance_id()
+            self.hb = norm_handbrake(handbrake.get_axis(HB_AXIS)) if (hid, HB_AXIS) in moved else 0.0
             self.hb_btn = 1 if handbrake.get_button(HB_BTN) else 0
         else:
             self.hb, self.hb_btn = 0.0, 0
@@ -345,10 +353,14 @@ def main():
 
     log("start", note=f"search {config.CAR_HOSTNAME} send {config.SEND_HZ}Hz")
 
+    moved = set()    # (instance id, axis) that have reported real motion
+
     try:
         while True:
             for ev in pygame.event.get():
-                if ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                if ev.type == pygame.JOYAXISMOTION:
+                    moved.add((ev.instance_id, ev.axis))
+                elif ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
                     had = wheel is not None
                     wheel = find_device(WHEEL_NAME_MATCH)
                     handbrake = find_device(HANDBRAKE_NAME_MATCH)
@@ -361,7 +373,7 @@ def main():
 
             if wheel is not None:
                 try:
-                    inp.read(wheel, handbrake)
+                    inp.read(wheel, handbrake, moved)
                 except pygame.error:
                     wheel = None
                     inp.neutral()
