@@ -43,6 +43,8 @@ def load_cached_ip():
 
 
 def save_cached_ip(ip):
+    if ip.startswith("127."):
+        return              # tools/sim_car.py on this laptop — never the real car
     try:
         os.makedirs(config.STATE_DIR, exist_ok=True)
         with open(CACHE_PATH, "w", encoding="utf-8") as f:

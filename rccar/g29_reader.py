@@ -11,7 +11,9 @@ terminal HUD:  python -m rccar.g29_reader
 import csv
 import datetime
 import json
+import multiprocessing
 import os
+import queue
 import signal
 import socket
 import sys
@@ -159,18 +161,100 @@ class Inputs:
     def neutral(self):
         self.__init__()
 
-    def packet(self, seq):
+    def fields(self):
+        """(steer, drive, brake, handbrake, gear, flags) as packet integers."""
         flags = ((self.hb_btn and protocol.FLAG_HB)
                  | (protocol.FLAG_TRIM_L if self.trim_l else 0)
                  | (protocol.FLAG_TRIM_R if self.trim_r else 0)
                  | (protocol.FLAG_TRIM_RST if self.trim_rst else 0))
-        return protocol.pack_drive(
-            seq,
-            int(clamp(round(self.steer * 1000), -1000, 1000)),
-            int(clamp(round(self.drive * 1000), -1000, 1000)),
-            int(clamp(round(self.brake * 1000), 0, 1000)),
-            int(clamp(round(self.hb * 1000), 0, 1000)),
-            self.gear, flags)
+        return (int(clamp(round(self.steer * 1000), -1000, 1000)),
+                int(clamp(round(self.drive * 1000), -1000, 1000)),
+                int(clamp(round(self.brake * 1000), 0, 1000)),
+                int(clamp(round(self.hb * 1000), 0, 1000)),
+                self.gear, flags)
+
+    @classmethod
+    def from_fields(cls, f):
+        """Rebuild for display from fields() (the network process never touches pygame)."""
+        inp = cls()
+        inp.steer, inp.drive, inp.brake, inp.hb = f[0] / 1000, f[1] / 1000, f[2] / 1000, f[3] / 1000
+        inp.gear, flags = f[4], f[5]
+        inp.hb_btn = 1 if flags & protocol.FLAG_HB else 0
+        inp.trim_l = 1 if flags & protocol.FLAG_TRIM_L else 0
+        inp.trim_r = 1 if flags & protocol.FLAG_TRIM_R else 0
+        inp.trim_rst = 1 if flags & protocol.FLAG_TRIM_RST else 0
+        return inp
+
+
+NEUTRAL_FIELDS = (0, 0, 0, 0, 0, 0)
+# If the wheel process hasn't produced a fresh reading for this long, send neutral.
+# (It stalls for seconds while Windows re-enumerates a flaky G29.)
+INPUT_STALE_S = 0.2
+
+
+def input_worker(shared, stamp, probe_buf, events):
+    """Separate process: read the wheel/pedals/handbrake as fast as possible.
+
+    Runs apart from the network loop because pygame/SDL can block for many seconds
+    while Windows re-enumerates a G29 that dropped off USB (seen: 24 s). In one
+    process that froze the 50 Hz sender, the car failsafed and got "lost". Now the
+    network side keeps the link alive and sends neutral while this is stuck.
+
+    shared: Array('i', 7) = fields() + wheel_ok. stamp: Value('d') time.monotonic()
+    of the last reading. probe_buf: button/hat probe text. events: Queue of
+    (kind, text) messages for the main process to print/log.
+    """
+    import multiprocessing
+    for sig in ("SIGINT", "SIGBREAK"):           # the parent handles shutdown
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), signal.SIG_IGN)
+    parent = multiprocessing.parent_process()
+
+    pygame.init()
+    pygame.joystick.init()
+    wheel = find_device(WHEEL_NAME_MATCH)
+    handbrake = find_device(HANDBRAKE_NAME_MATCH)
+    events.put(("wheel_init", wheel.get_name() if wheel else ""))
+    events.put(("hb_init", handbrake.get_name() if handbrake else ""))
+
+    inp = Inputs()
+    moved = set()    # (instance id, axis) that have reported real motion
+    next_parent_check = next_probe = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= next_parent_check:
+            next_parent_check = now + 0.5
+            if parent is not None and not parent.is_alive():
+                return                               # orphaned: release the wheel
+        for ev in pygame.event.get():
+            if ev.type == pygame.JOYAXISMOTION:
+                moved.add((ev.instance_id, ev.axis))
+            elif ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                had = wheel is not None
+                wheel = find_device(WHEEL_NAME_MATCH)
+                handbrake = find_device(HANDBRAKE_NAME_MATCH)
+                if had and wheel is None:
+                    events.put(("wheel_lost", ""))
+                elif not had and wheel is not None:
+                    events.put(("wheel_found", wheel.get_name()))
+        if wheel is not None:
+            try:
+                inp.read(wheel, handbrake, moved)
+            except pygame.error:
+                wheel = None
+                inp.neutral()
+        else:
+            inp.neutral()          # safety: no wheel = neutral, never stale input
+        with shared.get_lock():
+            shared[:] = list(inp.fields()) + [1 if wheel is not None else 0]
+            stamp.value = time.monotonic()
+        if wheel is not None and now >= next_probe:
+            next_probe = now + 0.2
+            try:
+                probe_buf.value = probe(wheel).encode()[:159]
+            except pygame.error:
+                pass
+        time.sleep(0.002)
 
 
 # --- Terminal output ------------------------------------------------------------
@@ -188,9 +272,15 @@ def ubar(v, width=20):
     return "[" + "#" * n + " " * (width - n) + "]"
 
 
-def status_line(finder, inp, tele, fresh, wheel_ok, net_err):
+def wheel_state(wheel_ok, input_fresh):
+    if not input_fresh:
+        return "WHEEL NOT RESPONDING (sending neutral) | "
+    return "" if wheel_ok else "NO WHEEL (sending neutral) | "
+
+
+def status_line(finder, inp, tele, fresh, wheel_ok, input_fresh, net_err):
     """One plain line for launch.py's shared console."""
-    wheel = "" if wheel_ok else "NO WHEEL (sending neutral) | "
+    wheel = wheel_state(wheel_ok, input_fresh)
     ins = (f"IN str {inp.steer * 100:+4.0f}% drv {inp.drive * 100:+4.0f}% "
            f"brk {inp.brake * 100:3.0f}% hb {inp.hb * 100:3.0f}% G{protocol.gear_name(inp.gear)}")
     if net_err:
@@ -207,7 +297,7 @@ def status_line(finder, inp, tele, fresh, wheel_ok, net_err):
             f"G{protocol.gear_name(t['gear'])} trim {t['trim']:+d}us")
 
 
-def render(finder, inp, tele, fresh, wheel, net_err):
+def render(finder, inp, tele, fresh, wheel_ok, input_fresh, probe_text, net_err):
     """Full-screen ANSI HUD for standalone runs."""
     out = ["\033[H"]
 
@@ -216,7 +306,9 @@ def render(finder, inp, tele, fresh, wheel, net_err):
 
     line("  RC CAR LINK  --  laptop mirror")
     line("  " + "-" * 60)
-    if wheel is None:
+    if not input_fresh:
+        line("  Wheel not responding (USB re-enumerating?) — car is held at neutral")
+    elif not wheel_ok:
         line("  G29 not connected — plug it in (car is held at neutral)")
     if net_err:
         line(f"  NETWORK: {net_err}")
@@ -239,9 +331,9 @@ def render(finder, inp, tele, fresh, wheel, net_err):
         line(f"  BRK  {ubar(inp.brake)} {inp.brake * 100:4.0f}%   {ubar(t['brake'] / 1000)} {t['brake'] / 10:4.0f}%")
         line(f"  HB   {ubar(inp.hb)} {inp.hb * 100:4.0f}%   {ubar(t['handbrake'] / 1000)} {t['handbrake'] / 10:4.0f}%")
     line()
-    if wheel is not None:
+    if wheel_ok:
         trim_disp = ("<" if inp.trim_l else " ") + ("o" if inp.trim_rst else " ") + (">" if inp.trim_r else " ")
-        line(f"  controls: dpad {trim_disp}   in {probe(wheel)}")
+        line(f"  controls: dpad {trim_disp}   in {probe_text}")
     out.append("\033[J")
     sys.stdout.write("\n".join(out))
     sys.stdout.flush()
@@ -307,8 +399,20 @@ def main():
         except Exception:
             winmm = None
 
-    pygame.init()
-    pygame.joystick.init()
+    # Wheel input lives in its own process (see input_worker for why).
+    ctx = multiprocessing.get_context("spawn")
+    shared = ctx.Array("i", 7)
+    input_stamp = ctx.Value("d", 0.0)
+    probe_buf = ctx.Array("c", 160)
+    events = ctx.Queue()
+
+    def start_worker():
+        p = ctx.Process(target=input_worker, args=(shared, input_stamp, probe_buf, events),
+                        name="wheel-input", daemon=True)
+        p.start()
+        return p
+
+    worker = start_worker()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 0))
@@ -316,13 +420,8 @@ def main():
     fwd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # -> stream server
     finder = CarFinder(sock)
 
-    wheel = find_device(WHEEL_NAME_MATCH)
-    handbrake = find_device(HANDBRAKE_NAME_MATCH)
-
     print(f"Looking for the car ('{config.CAR_HOSTNAME}.local' / broadcast on UDP {config.CAR_UDP_PORT})"
           + (f", starting with {config.CAR_IP_OVERRIDE}" if config.CAR_IP_OVERRIDE else ""))
-    print(f"Wheel: {wheel.get_name() if wheel else 'NOT FOUND — plug in the G29 (car held at neutral)'}")
-    print(f"Handbrake: {handbrake.get_name() if handbrake else 'not found (optional)'}")
     print("Trim: d-pad left/right = trim, d-pad down = reset.  Ctrl+C to quit.")
     if not LAUNCHER_MODE:
         time.sleep(1.0)
@@ -353,32 +452,52 @@ def main():
 
     log("start", note=f"search {config.CAR_HOSTNAME} send {config.SEND_HZ}Hz")
 
-    moved = set()    # (instance id, axis) that have reported real motion
+    fields, wheel_ok, input_fresh = NEUTRAL_FIELDS, False, False
+    input_ever_fresh = False
 
     try:
         while True:
-            for ev in pygame.event.get():
-                if ev.type == pygame.JOYAXISMOTION:
-                    moved.add((ev.instance_id, ev.axis))
-                elif ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
-                    had = wheel is not None
-                    wheel = find_device(WHEEL_NAME_MATCH)
-                    handbrake = find_device(HANDBRAKE_NAME_MATCH)
-                    if had and wheel is None:
-                        print("G29 disconnected — holding the car at neutral.", flush=True)
-                        log("wheel_lost")
-                    elif not had and wheel is not None:
-                        print(f"Wheel connected: {wheel.get_name()}", flush=True)
-                        log("wheel_found")
-
-            if wheel is not None:
+            # Messages from the wheel process.
+            while True:
                 try:
-                    inp.read(wheel, handbrake, moved)
-                except pygame.error:
-                    wheel = None
-                    inp.neutral()
+                    kind, text = events.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "wheel_init":
+                    print(f"Wheel: {text or 'NOT FOUND — plug in the G29 (car held at neutral)'}", flush=True)
+                elif kind == "hb_init":
+                    print(f"Handbrake: {text or 'not found (optional)'}", flush=True)
+                elif kind == "wheel_lost":
+                    print("G29 disconnected — holding the car at neutral.", flush=True)
+                    log("wheel_lost")
+                elif kind == "wheel_found":
+                    print(f"Wheel connected: {text}", flush=True)
+                    log("wheel_found")
+
+            if not worker.is_alive():
+                print(f"Wheel input process exited (code {worker.exitcode}); restarting it.", flush=True)
+                log("input_restart", note=f"exit {worker.exitcode}")
+                worker = start_worker()
+
+            # Latest wheel reading — neutral if it's stale (worker stuck or starting).
+            with shared.get_lock():
+                snap, snap_t = shared[:], input_stamp.value
+            fresh_now = snap_t > 0 and time.monotonic() - snap_t < INPUT_STALE_S
+            if fresh_now != input_fresh and (fresh_now or input_ever_fresh):
+                if fresh_now:
+                    if input_ever_fresh:
+                        print("Wheel input is back.", flush=True)
+                        log("input_ok")
+                else:
+                    print("Wheel input stalled — sending neutral until it recovers.", flush=True)
+                    log("input_stall")
+            input_fresh = fresh_now
+            input_ever_fresh = input_ever_fresh or fresh_now
+            if input_fresh:
+                fields, wheel_ok = tuple(snap[:6]), bool(snap[6])
             else:
-                inp.neutral()          # safety: no wheel = neutral, never stale input
+                fields = NEUTRAL_FIELDS
+            inp = Inputs.from_fields(fields)
 
             now = time.perf_counter()
 
@@ -392,7 +511,8 @@ def main():
                                 note=f"gap {interval * 1000:.0f}ms")
                     last_send_t = now
                     try:
-                        sock.sendto(inp.packet(seq), (finder.ip, config.CAR_UDP_PORT))
+                        sock.sendto(protocol.pack_drive(seq, *fields),
+                                    (finder.ip, config.CAR_UDP_PORT))
                         if net_err:
                             log("net_ok")
                         net_err = None
@@ -490,7 +610,7 @@ def main():
                               "failsafe" if fresh and tele else
                               "connecting" if finder.locked else "searching"),
                     "ip": finder.ip, "via": finder.via,
-                    "wheel": wheel is not None,
+                    "wheel": wheel_ok and input_fresh,
                     "netError": net_err,
                     "search": None if finder.locked else finder.describe_search(),
                 }
@@ -500,13 +620,15 @@ def main():
                     pass
 
             if LAUNCHER_MODE:
-                driving = finder.locked and fresh and wheel is not None and not net_err
+                driving = finder.locked and fresh and wheel_ok and input_fresh and not net_err
                 period = STATUS_PERIOD_S if driving else SEARCH_PERIOD_S
                 if now - last_line_t >= period:
                     last_line_t = now
-                    print(status_line(finder, inp, tele, fresh, wheel is not None, net_err), flush=True)
+                    print(status_line(finder, inp, tele, fresh, wheel_ok, input_fresh, net_err),
+                          flush=True)
             elif now >= next_draw:
-                render(finder, inp, tele, fresh, wheel, net_err)
+                render(finder, inp, tele, fresh, wheel_ok, input_fresh,
+                       probe_buf.value.decode(errors="replace"), net_err)
                 next_draw = now + 1.0 / REFRESH_HZ
 
             time.sleep(0.001)
@@ -520,6 +642,9 @@ def main():
                     pass
                 seq += 1
     finally:
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(1.0)
         finder.close()
         sock.close()
         fwd.close()
